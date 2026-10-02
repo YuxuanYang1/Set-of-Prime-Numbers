@@ -1,11 +1,17 @@
 import math
 import os
+import json
 from math import isqrt
 from multiprocessing import Pool, cpu_count
 
 FILENAME = 'prime.txt'
-SEGMENT_SIZE = 1 << 20      # 每段 100 万个数
-TASKS_PER_WORKER = 4        # 每个进程一次领多少个段，减少通信开销
+STATE_FILE = 'prime_state.json'
+
+# 目标：每段大约产出这么多个素数（自适应段长会围绕它调整）
+TARGET_PRIMES_PER_SEGMENT = 50_000
+MIN_SEGMENT = 1 << 16        # 最小段长 6.5 万
+MAX_SEGMENT = 1 << 24        # 最大段长 1600 万
+TASKS_PER_WORKER = 4
 
 
 # ---------- 基础工具 ----------
@@ -19,8 +25,24 @@ def load_primes(filename):
     return primes or [2]
 
 
+def load_state():
+    """读取断点状态；不存在则返回 None。"""
+    try:
+        with open(STATE_FILE, 'r') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def save_state(state):
+    """原子写入状态文件，避免崩溃时写坏。"""
+    tmp = STATE_FILE + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(state, f)
+    os.replace(tmp, STATE_FILE)
+
+
 def simple_sieve(limit):
-    """普通筛，生成 [2, limit] 内所有素数。"""
     if limit < 2:
         return []
     sieve = bytearray([1]) * (limit + 1)
@@ -32,21 +54,33 @@ def simple_sieve(limit):
     return [i for i, v in enumerate(sieve) if v]
 
 
+def adaptive_segment_size(cur):
+    """根据当前数值量级调整段长，让每段产出素数个数大致稳定。"""
+    ln = math.log(cur) if cur > 2 else 1.0
+    size = int(TARGET_PRIMES_PER_SEGMENT * ln)
+    size = max(MIN_SEGMENT, min(MAX_SEGMENT, size))
+    # 对齐到 2 的倍数，方便处理（非必须）
+    return size & ~1
+
+
 # ---------- 工作进程 ----------
 
+_BASE_PRIMES = None
+
+def _init_worker(base_primes):
+    global _BASE_PRIMES
+    _BASE_PRIMES = base_primes
+
+
 def sieve_segment(args):
-    """
-    筛一个区间 (start, end]，返回该区间内的素数列表。
-    base_primes 通过全局变量传入，避免每次 pickle 传输（见下方 initializer）。
-    """
     start, end = args
-    base_primes = _BASE_PRIMES  # 由 initializer 注入
+    base_primes = _BASE_PRIMES
 
     if end < 2 or end <= start:
         return []
 
     size = end - start
-    sieve = bytearray([1]) * size  # 索引 i 对应数字 start + 1 + i
+    sieve = bytearray([1]) * size
 
     for p in base_primes:
         if p * p > end:
@@ -60,68 +94,102 @@ def sieve_segment(args):
     return [start + 1 + i for i, v in enumerate(sieve) if v]
 
 
-_BASE_PRIMES = None
-
-def _init_worker(base_primes):
-    """在每个工作进程启动时调用一次，把基础素数表放进进程内存。"""
-    global _BASE_PRIMES
-    _BASE_PRIMES = base_primes
-
-
 # ---------- 主流程 ----------
 
 def main():
     primes = load_primes(FILENAME)
-    cur = primes[-1]
-    print(f"last number recorded was: {cur}")
 
-    # 保证基础素数表至少覆盖一个初始范围
-    base_limit = max(1000, isqrt(cur) + 1)
+    state = load_state()
+    if state is None:
+        # 首次运行：用文件里最后一个素数作为起点
+        cur = primes[-1]
+        last_written = primes[-1]
+        print(f"[fresh start] last number recorded was: {cur}")
+    else:
+        cur = state['next_start']
+        last_written = state['last_written']
+        print(f"[resume] next_start={cur}, last_written={last_written}")
+        # 从文件尾部校验：文件最后一个数应与 last_written 一致
+        if primes[-1] != last_written:
+            print(f"[warn] file last={primes[-1]} != state last={last_written}")
+            # 以文件中实际存在的为准，回退到文件末尾
+            cur = primes[-1]
+            last_written = primes[-1]
+            print(f"[warn] falling back to file tail: {cur}")
+
+    # 基础素数表：覆盖 sqrt(第一个段 end) 以内
+    first_seg = adaptive_segment_size(cur)
+    base_limit = max(1000, isqrt(cur + first_seg * TASKS_PER_WORKER * cpu_count()) + 1)
     if primes[-1] < base_limit:
         primes = simple_sieve(base_limit)
 
-    num_workers = max(1, cpu_count() - 1)  # 留一个核给主进程
+    num_workers = max(1, cpu_count() - 1)
     print(f"using {num_workers} worker processes")
 
-    with open(FILENAME, 'a') as f:
-        with Pool(num_workers, initializer=_init_worker,
-                  initargs=(primes,)) as pool:
-            while True:
-                # 规划一批任务：num_workers * TASKS_PER_WORKER 个连续段
-                batch = num_workers * TASKS_PER_WORKER
-                tasks = []
-                for _ in range(batch):
-                    start = cur
-                    end = start + SEGMENT_SIZE
-                    # 保证基础素数覆盖 sqrt(end)
-                    needed = isqrt(end)
-                    if primes[-1] < needed:
-                        primes = simple_sieve(needed)
-                        # 基础表变了，需要重建 pool 才能让 worker 用上新表
-                        pool.terminate()
-                        pool = Pool(num_workers, initializer=_init_worker,
-                                    initargs=(primes,))
-                    tasks.append((start, end))
-                    cur = end
+    # 打开文件追加
+    f = open(FILENAME, 'a')
+    try:
+        pool = Pool(num_workers, initializer=_init_worker, initargs=(primes,))
 
-                # 并行筛
-                results = pool.map(sieve_segment, tasks)
+        while True:
+            batch = num_workers * TASKS_PER_WORKER
+            tasks = []
+            for _ in range(batch):
+                size = adaptive_segment_size(cur)
+                start = cur
+                end = start + size
 
-                # 按区间顺序合并（map 保证顺序）
-                all_new = []
-                for seg_primes in results:
-                    all_new.extend(seg_primes)
+                # 保证基础表覆盖 sqrt(end)
+                needed = isqrt(end)
+                if primes[-1] < needed:
+                    primes = simple_sieve(needed)
+                    pool.terminate()
+                    pool = Pool(num_workers, initializer=_init_worker,
+                                initargs=(primes,))
 
-                if all_new:
-                    for p in all_new:
-                        f.write(f"{p}\n")
-                    f.flush()
-                    primes.extend(all_new)
-                    print(f"batch done: +{len(all_new)} primes, "
-                          f"total {len(primes)}, "
-                          f"last {all_new[-1]}")
-                else:
-                    print("batch done: no new primes")
+                tasks.append((start, end))
+                cur = end
+
+            results = pool.map(sieve_segment, tasks)
+
+            all_new = []
+            for seg_primes in results:
+                all_new.extend(seg_primes)
+
+            # 写盘
+            if all_new:
+                f.write('\n'.join(str(p) for p in all_new) + '\n')
+                f.flush()
+                os.fsync(f.fileno())  # 强制落盘，断点才可靠
+                primes.extend(all_new)
+                last_written = all_new[-1]
+
+            # 更新状态（每批一次，代价可忽略）
+            save_state({
+                'next_start': cur,
+                'last_written': last_written,
+                'total_primes': len(primes),
+            })
+
+            print(f"batch done: +{len(all_new)} primes, "
+                  f"total {len(primes)}, last {last_written}, "
+                  f"next_start {cur}")
+
+    except KeyboardInterrupt:
+        print("\n[interrupted] saving state...")
+    finally:
+        save_state({
+            'next_start': cur,
+            'last_written': last_written,
+            'total_primes': len(primes),
+        })
+        try:
+            pool.terminate()
+            pool.join()
+        except Exception:
+            pass
+        f.close()
+
 
 if __name__ == '__main__':
     main()
